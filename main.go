@@ -13,6 +13,7 @@ import (
 func main() {
 	// 1. Parse Arguments
 	ext := flag.String("ext", "", "File extension to count (e.g., .go, .txt)")
+	skipComments := flag.Bool("skip-comments", false, "Exclude comments from count")
 	flag.Usage = func() {
 		fmt.Printf("Usage: %s [options] <directory>\n", os.Args[0])
 		flag.PrintDefaults()
@@ -39,6 +40,9 @@ func main() {
 	var fileCount int
 
 	fmt.Printf("Counting lines for files with extension: %s in %s\n", *ext, root)
+	if *skipComments {
+		fmt.Println("Excluding comments...")
+	}
 
 	// 2. Walk Directory
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -57,7 +61,7 @@ func main() {
 
 		// 3. Filter Files
 		if strings.HasSuffix(path, *ext) {
-			lines, err := countLines(path)
+			lines, err := countLines(path, *skipComments)
 			if err != nil {
 				fmt.Printf("Error reading %s: %v\n", path, err)
 				return nil // Continue even if one file fails
@@ -81,7 +85,7 @@ func main() {
 }
 
 // 4. Count Lines
-func countLines(path string) (int64, error) {
+func countLines(path string, skipComments bool) (int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return 0, err
@@ -90,8 +94,64 @@ func countLines(path string) (int64, error) {
 
 	scanner := bufio.NewScanner(file)
 	var lines int64
+	inBlockComment := false
+
 	for scanner.Scan() {
-		lines++
+		text := strings.TrimSpace(scanner.Text())
+
+		if !skipComments {
+			lines++
+			continue
+		}
+
+		if text == "" {
+			continue
+		}
+
+		// Handle block comments (C-style /* ... */)
+		if inBlockComment {
+			if idx := strings.Index(text, "*/"); idx != -1 {
+				inBlockComment = false
+				text = text[idx+2:]
+			} else {
+				continue // Still in block comment
+			}
+		}
+
+		// Clean up the line iteratively
+		for {
+			startIdx := strings.Index(text, "/*")
+			lineCommentIdx := strings.Index(text, "//")
+
+			// Check for single line comment "//"
+			// It takes precedence if it appears before "/*"
+			if lineCommentIdx != -1 && (startIdx == -1 || lineCommentIdx < startIdx) {
+				text = text[:lineCommentIdx]
+				break
+			}
+
+			// Check for block comment start "/*"
+			if startIdx != -1 {
+				// Look for end of block comment "*/"
+				endIdx := strings.Index(text[startIdx+2:], "*/")
+				if endIdx != -1 {
+					// Complete block comment on same line: remove it and continue
+					text = text[:startIdx] + text[startIdx+2+endIdx+2:]
+					continue
+				} else {
+					// Block comment continues to next line
+					inBlockComment = true
+					text = text[:startIdx]
+					break
+				}
+			}
+
+			break // No more comments found
+		}
+
+		if strings.TrimSpace(text) != "" {
+			lines++
+		}
 	}
 	return lines, scanner.Err()
 }
