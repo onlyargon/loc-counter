@@ -10,9 +10,90 @@ import (
 	"strings"
 )
 
+// BlockComment defines the start and end tokens for a block comment
+type BlockComment struct {
+	Start string
+	End   string
+}
+
+// CommentStyle defines the comment syntax for a language
+type CommentStyle struct {
+	LineComments  []string
+	BlockComments []BlockComment
+}
+
+// LanguageStyles maps file extensions to their comment styles
+var languageStyles = map[string]CommentStyle{
+	// Single-line: //, Block: /* */
+	".c":    cStyle,
+	".cpp":  cStyle,
+	".java": cStyle,
+	".js":   cStyle,
+	".ts":   cStyle,
+	".cs":   cStyle,
+	".swift": cStyle,
+	".rs":   cStyle, // Rust
+	".go":   cStyle,
+	".kt":   cStyle, // Kotlin
+	".php":  cStyle,
+	".css":  {BlockComments: []BlockComment{{"/*", "*/"}}}, // CSS usually only has block comments
+
+	// Single-line: #
+	".py": {
+		LineComments: []string{"#"},
+		BlockComments: []BlockComment{
+			{`"""`, `"""`},
+			{`'''`, `'''`},
+		},
+	},
+	".rb": {
+		LineComments: []string{"#"},
+		BlockComments: []BlockComment{
+			{"=begin", "=end"},
+		},
+	},
+	".pl":  shellStyle, // Perl
+	".sh":  shellStyle, // Bash
+	".yaml": shellStyle,
+	".yml":  shellStyle,
+	".r":   shellStyle,
+	".ps1": shellStyle, // PowerShell
+
+	// Single-line: --
+	".sql":  {LineComments: []string{"--"}, BlockComments: []BlockComment{{"/*", "*/"}}},
+	".lua":  {LineComments: []string{"--"}, BlockComments: []BlockComment{{"--[[", "]]"}}},
+	".hs":   {LineComments: []string{"--"}, BlockComments: []BlockComment{{"{-", "-}"}}},
+	".ada":  {LineComments: []string{"--"}},
+
+	// Single-line: '
+	".vb": {LineComments: []string{"'"}},
+
+	// Single-line: ;
+	".asm": {LineComments: []string{";"}},
+	".lisp": {LineComments: []string{";"}},
+	".clj":  {LineComments: []string{";"}},
+	".ini":  {LineComments: []string{";", "#"}}, // INI often supports both
+
+	// Single-line: %
+	".m":   {LineComments: []string{"%"}, BlockComments: []BlockComment{{"%{", "%}"}}}, // Matlab/Octave
+	".tex": {LineComments: []string{"%"}},
+
+	// Mixed / Others
+	".bat": {LineComments: []string{"REM", "::"}},
+	".html": {BlockComments: []BlockComment{{"<!--", "-->"}}},
+	".xml":  {BlockComments: []BlockComment{{"<!--", "-->"}}},
+	".pas":  {BlockComments: []BlockComment{{"(*", "*)"}, {"{", "}"}}},
+}
+
+var (
+	cStyle     = CommentStyle{LineComments: []string{"//"}, BlockComments: []BlockComment{{"/*", "*/"}}}
+	shellStyle = CommentStyle{LineComments: []string{"#"}}
+	luaStyle   = CommentStyle{LineComments: []string{"--"}}
+)
+
 func main() {
 	// 1. Parse Arguments
-	ext := flag.String("ext", "", "File extension to count (e.g., .go, .txt)")
+	ext := flag.String("ext", "", "File extension to count (e.g., .go, .py)")
 	skipComments := flag.Bool("skip-comments", false, "Exclude comments from count")
 	flag.Usage = func() {
 		fmt.Printf("Usage: %s [options] <directory>\n", os.Args[0])
@@ -40,8 +121,16 @@ func main() {
 	var fileCount int
 
 	fmt.Printf("Counting lines for files with extension: %s in %s\n", *ext, root)
+	
+	style, hasStyle := languageStyles[*ext]
 	if *skipComments {
-		fmt.Println("Excluding comments...")
+		if hasStyle {
+			fmt.Println("Excluding comments...")
+		} else {
+			fmt.Printf("Warning: No comment style defined for %s. Treating all lines as code.\n", *ext)
+			// fallback: disable comment skipping if we don't know the style
+			*skipComments = false
+		}
 	}
 
 	// 2. Walk Directory
@@ -51,8 +140,6 @@ func main() {
 		}
 
 		if d.IsDir() {
-			// Skip .git and other common hidden directories if needed,
-			// but for now we just walk everything.
 			if d.Name() == ".git" {
 				return filepath.SkipDir
 			}
@@ -61,15 +148,13 @@ func main() {
 
 		// 3. Filter Files
 		if strings.HasSuffix(path, *ext) {
-			lines, err := countLines(path, *skipComments)
+			lines, err := countLines(path, *skipComments, style)
 			if err != nil {
 				fmt.Printf("Error reading %s: %v\n", path, err)
-				return nil // Continue even if one file fails
+				return nil
 			}
 			totalLines += lines
 			fileCount++
-			// Optional: print per-file count
-			// fmt.Printf("%s: %d\n", path, lines)
 		}
 		return nil
 	})
@@ -85,7 +170,7 @@ func main() {
 }
 
 // 4. Count Lines
-func countLines(path string, skipComments bool) (int64, error) {
+func countLines(path string, skipComments bool, style CommentStyle) (int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return 0, err
@@ -94,7 +179,10 @@ func countLines(path string, skipComments bool) (int64, error) {
 
 	scanner := bufio.NewScanner(file)
 	var lines int64
+	
+	// State for block comments
 	inBlockComment := false
+	var currentBlockEnd string
 
 	for scanner.Scan() {
 		text := strings.TrimSpace(scanner.Text())
@@ -108,45 +196,81 @@ func countLines(path string, skipComments bool) (int64, error) {
 			continue
 		}
 
-		// Handle block comments (C-style /* ... */)
+		// If inside a block comment, look for the end token
 		if inBlockComment {
-			if idx := strings.Index(text, "*/"); idx != -1 {
+			if idx := strings.Index(text, currentBlockEnd); idx != -1 {
 				inBlockComment = false
-				text = text[idx+2:]
+				text = text[idx+len(currentBlockEnd):]
+				// clear end token
+				currentBlockEnd = ""
 			} else {
 				continue // Still in block comment
 			}
 		}
 
-		// Clean up the line iteratively
+		// Process the line for comments
 		for {
-			startIdx := strings.Index(text, "/*")
-			lineCommentIdx := strings.Index(text, "//")
-
-			// Check for single line comment "//"
-			// It takes precedence if it appears before "/*"
-			if lineCommentIdx != -1 && (startIdx == -1 || lineCommentIdx < startIdx) {
-				text = text[:lineCommentIdx]
+			text = strings.TrimSpace(text)
+			if text == "" {
 				break
 			}
 
-			// Check for block comment start "/*"
-			if startIdx != -1 {
-				// Look for end of block comment "*/"
-				endIdx := strings.Index(text[startIdx+2:], "*/")
-				if endIdx != -1 {
-					// Complete block comment on same line: remove it and continue
-					text = text[:startIdx] + text[startIdx+2+endIdx+2:]
-					continue
-				} else {
-					// Block comment continues to next line
-					inBlockComment = true
-					text = text[:startIdx]
-					break
+			// Find nearest comment start
+			bestIdx := -1
+			matchType := 0 // 1: line, 2: block
+			var matchedBlock BlockComment
+
+			// check line comments
+			for _, start := range style.LineComments {
+				idx := strings.Index(text, start)
+				if idx != -1 {
+					if bestIdx == -1 || idx < bestIdx {
+						bestIdx = idx
+						matchType = 1
+					}
 				}
 			}
 
-			break // No more comments found
+			// check block comments
+			for _, bc := range style.BlockComments {
+				idx := strings.Index(text, bc.Start)
+				if idx != -1 {
+					if bestIdx == -1 || idx < bestIdx {
+						bestIdx = idx
+						matchType = 2
+						matchedBlock = bc
+					}
+				}
+			}
+
+			if bestIdx == -1 {
+				// No comments found in remaining text
+				break
+			}
+
+			if matchType == 1 {
+				// Line comment found, ignore rest of line
+				text = text[:bestIdx]
+				break
+			} else {
+				// Block comment found
+				// Check if it closes on the same line
+				remaining := text[bestIdx+len(matchedBlock.Start):]
+				endIdx := strings.Index(remaining, matchedBlock.End)
+				
+				if endIdx != -1 {
+					// Closed on same line
+					// remove the comment part
+					text = text[:bestIdx] + remaining[endIdx+len(matchedBlock.End):]
+					continue // loop again to find more comments
+				} else {
+					// Opens here, continues
+					inBlockComment = true
+					currentBlockEnd = matchedBlock.End
+					text = text[:bestIdx]
+					break
+				}
+			}
 		}
 
 		if strings.TrimSpace(text) != "" {
